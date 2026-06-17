@@ -1,0 +1,202 @@
+# AssetBridge — Engine de Normalização e Portabilidade Patrimonial (IUP)
+
+## O que é este sistema
+
+Produto **independente** de ingestão e normalização de ativos de renda fixa privada vindos de **múltiplos custodiantes** (inclusive BTG), em descrições de texto caótico e sem garantia de chave forte (ISIN/CUSIP). O AssetBridge normaliza esses ativos e emite o **IUP** (Identificador Universal de Portabilidade) — a identidade canônica, estável entre custodiantes.
+
+AssetBridge é a **autoridade única do IUP**: nenhum outro sistema cria IUP. Roda de forma autônoma e **alimenta o Oikos** (módulo de reconciliação) via API. É um **turbinador opcional**: o Oikos funciona 100% sozinho com sua identidade interna (ISIN/CNPJ); quando o AssetBridge está disponível, enriquece com IUP e normalização — nunca é dependência para funções centrais do Oikos (degradação graciosa). Ver ADR-0015 do Oikos.
+
+Escopo: **ingestão → identidade (IUP) → posição**, com **pass-through de lançamentos de caixa normalizados** (entrega estruturada, sem interpretar). **Cálculo/reconciliação de caixa, reconciliação e breaks são do Oikos** — "não fazer caixa" significa não reconciliar, não que deixa de entregar os lançamentos. Isso evita mutilar a reconciliação do Oikos em custodiantes ingeridos só pelo AssetBridge.
+
+## Domínio
+
+### Entidades centrais
+
+- **Ativo**: instrumento de renda fixa privada (CDB/RDP, CRA/CRI, LF/LFN).
+- **IUP** (Identificador Universal de Portabilidade): identidade canônica e estável de um ativo, atribuída pelo AssetBridge após resolução. É o que sai para consumidores (FK no Oikos). O **IUP canônico é um surrogate opaco e imutável** — nunca muda, mesmo quando o HITL corrige um campo.
+- **Rótulo semântico do IUP**: string auto-explicativa derivada por classe (ex: `IUP-CRI-{CNPJ_SECURITIZADORA}-SERIE{SERIE}-{VENC}`), **só para exibição**. É recalculável e pode mudar com correção; **não** é a chave e ninguém referencia por ele. **Não é persistido** (recalcula on read). **Degrada gracioso:** quando faltam CNPJ/série (caso BTG, que só traz ISIN/classe/venc — ADR-0003), o builder usa ISIN+classe+venc em vez de emitir `None` (ex: `IUP-CRI-BRIMWLCRI6O9-2030-01-01`).
+- **Chave sintética provisória**: hash dos metadados extraídos numa ingestão. **Não é o IUP** — é só um balde de primeira passada, pode ser instável/duplicado. Nunca exposta a consumidores.
+- **Alias**: vínculo `chave provisória → IUP canônico`. Permite consolidar duplicatas sem reprocessar; merge reversível com histórico.
+- **Custodiante**: origem do arquivo/descrição (BTG, e outros).
+- **Carteira**: unidade de ingestão = snapshot de **uma conta num custodiante** (`id_carteira` + `custodiante`). Conceito próprio do AssetBridge. **Não** é assumida igual a "fundo": quando a origem é BTG, a carteira **resolve para um fundo (CNPJ)** do Oikos; as posições entregues carregam `id_carteira`+`custodiante` para o Oikos fazer o de-para. (Portabilidade a nível de investidor cross-fundo fica fora do MVP.)
+
+### Nomenclatura e distinções que importam ao domínio
+
+- **Emissor** (quem deve o papel comercialmente) ≠ **Securitizadora** (emissora legal de CRI/CRA, ex: Opea, Virgo) ≠ **Lastro/Devedor** (projeto real por trás, ex: Iguatemi, JBS). Para CRI/CRA o Grafo mapeia a relação triangular `Custodiante → Securitizadora → Lastro`.
+- **Subordinação** (LF): flag de risco (`SUB`/`SENIOR`). Sênior e subordinada do mesmo emissor/vencimento **nunca** podem se fundir.
+- **Série / Emissão** (CRI/CRA): distinguem papéis do mesmo emissor; mudança de série = ativo diferente.
+- **Identidade do AssetBridge (IUP)** ≠ **identidade interna do Oikos** (`instrument` por ISIN/CNPJ). O Oikos guarda o IUP como FK; nunca o cria.
+- **Chave forte**: identificador determinístico que basta para cunhar/casar o IUP **sem HITL**. No **BTG o ISIN é a chave forte** quando presente (placeholder `BR0000000000` = nulo); no texto caótico, a chave forte é composta (CNPJ emissor + vencimento + série/subordinação). **Sem chave forte → HITL** (ver ADR-0003). Observação: a premissa "não depender de ISIN" vale para a portabilidade cross-custodiante (unificação via alias/merge), não impede usar o ISIN como chave forte quando ele existe.
+
+## Arquitetura
+
+> **Nota:** esta seção descreve a **arquitetura-alvo**. O que já está implementado no MVP está em **"Estado da implementação (MVP atual)"** mais abaixo. LangGraph já adotado (ADR-0010); Ollama/DuckDB/Polars/Faiss adotados de forma antecipada (ADR-0012, supera 0002) — cada peça entra com teste (TDD).
+
+Orquestração por **LangGraph** (nós determinísticos + nós LLM). Processamento assíncrono concorrente por carteira (`thread_id`).
+
+### Camada 1 — Extração (híbrida)
+
+- **Regex/parse determinístico** para campos fortes de alta precisão: CNPJ, datas (vencimento/emissão), percentuais/taxa.
+- **LLM local (Ollama), saída estruturada Pydantic** para campos fuzzy: classe, emissor, série/emissão, subordinação, lastro. **Modelo (default atual):** `qwen3:8b` **por enquanto** (cabe em host menor); **alvo eventual** `qwen3:14b` Q4_K_M (alinhado ao Oikos, ADR-0013/0014) em host capaz (~10GB+ VRAM). `llama3.1:8b`/`phi3.5` no notebook 6GB **só para dev**. Sem stack de modelo paralela; sem cloud no MVP. Extração mais fraca = mais HITL e risco de duplicata, por isso prioriza-se qualidade aqui.
+- **Emissor resolvido por tabela de lookup/registro**, nunca `if "OPEA"` hardcoded.
+- **Classifica a classe primeiro** (extração), depois aplica regras por classe **config-driven** (campos de identidade, template de IUP, validações) atrás de uma interface mínima `ClassRules`. Sem Factory por substring. A interface permite promover a Strategy/polimorfismo se a lógica por classe crescer — não antes (evita over-abstraction).
+- LLM **só propõe**; campos fortes mandam; LLM nunca inventa CNPJ/data. **Postura agêntica: não-determinismo do LLM nunca toca a identidade; auto-act só em certeza forte; extração versionada — ver ADR-0007.**
+
+### Camada de enriquecimento web (ADR-0010)
+
+BTG entrega dado pobre (ISIN/classe/venc — ADR-0003). Um **nó agêntico no grafo** pesquisa fontes externas e completa as **características** do ativo (emissor real, securitizadora, lastro/devedor, rating, setor, nome longo). Opera sobre ativos **já identificados** (não depende de amostra não-BTG; é fatia de valor sobre o BTG atual).
+
+- **Não-autoritativo sempre:** nada da web vira verdade do registro sem humano. Alimenta exibição + aid do HITL.
+- **Nunca toca identidade; pode propor campo forte como candidato HITL:** mesma fronteira do LLM (ADR-0007). Característica → enriquece; campo forte faltante (CNPJ/série/venc) → **candidato na `pending_resolution`**, nunca auto-cunha.
+- **Fontes híbridas:** registros oficiais primeiro (CVM, B3, ANBIMA, securitizadora); web aberta como fallback **marcado com confiança menor**.
+- **Proveniência própria** (≠ landing zone): tabela `enrichment` (`iup`, `campo`, `valor`, `fonte`, `fonte_url`, `query`, `confianca`, `fetched_at`, `modelo/versão`) + **snapshot do que foi buscado** (web não é reproduzível). Versionado.
+- **Best-effort, degrada gracioso:** roda depois da identidade, em paralelo, com timeout; falha → entrega sem enriquecimento, nunca bloqueia (postura da integração Oikos, ADR-0008).
+
+### Identidade e resolução
+
+1. Extrai metadados → gera **chave sintética provisória** (hash do extraído).
+2. **Resolução** contra o registro: match → IUP existente. Chave incompleta/ambígua (ex: só nome fantasia, sem CNPJ) → **HITL** resolve antes de cunhar. Sem candidato → cunha IUP novo.
+3. **Dedup ao longo do tempo**: candidatos duplicados → **alias table** (provisório → IUP canônico), **merge reversível com log/histórico**, nunca silencioso. Propagação ao Oikos via IUP canônico (Oikos resolve/reponta pelo alias).
+   - **Sobrevivência (merge de dois IUPs já cunhados):** sobrevivente default = **IUP mais antigo** (estável/previsível), com **override humano** quando o registro antigo for o errado. O perdedor vira **alias permanente → vencedor**; consumidores repontam via resolução de alias.
+
+### Camada 2 — Comportamento de caixa
+
+- **MVP: forma reduzida** — coerência simples de PU entre snapshots do mesmo IUP ao longo do tempo (validação, detecta saltos impossíveis). **Não** há matching por série ainda.
+- **Faiss adotado (ADR-0012, `matching.py`):** `VectorMatcher` (índice `IndexFlatIP` sobre vetores normalizados = cosseno) via porta `Embedder` (fake no teste; modelo real depois). Para ativo sem chave forte, sugere os IUPs mais parecidos como **AID do HITL** — NÃO-autoritativo, nunca auto-liga identidade (fronteira ADR-0007/0010). DTW/regressão entram com a série temporal de PU real acumulada. Cada peça com teste (TDD).
+
+### Human-in-the-loop
+
+Grafo pausa via `interrupt_before` antes de gravar o IUP definitivo. **Fronteira de autonomia: ver ADR-0007. Gatilho no MVP (conservador):** auto-cunha/auto-liga só em **match exato de chave forte completa**; qualquer ambiguidade (CNPJ ausente, múltiplos candidatos, LLM baixa confiança) → HITL. Isso também gera o dado rotulado que hoje falta p/ calibrar limiares. A **zona cinzenta por correlação de caixa** (0.75–0.90 da spec) só volta quando a Camada 2 cheia entrar — não existe no MVP. Decisão humana registrada; merges confirmados por humano (operação destrutiva de identidade → reversível e logada).
+
+**Onde o humano atua (API-first):** o HITL é exposto como contrato de endpoints (`GET /pending`, `POST /pending/{id}/decision`, `POST /merge`, `POST /merge/{id}/revert`); uma **UI própria fina** do AssetBridge consome logo depois. Nunca pendurar no frontend do Oikos — isso mataria o standalone. Backoffice próprio porque o HITL é função central do produto.
+
+**Expiração:** timeout **nunca decide identidade**. Pendência fica pendente; passou do SLA (ex: 48h) → alerta + sobe prioridade na fila + notifica. Sem auto-merge e sem auto-cunhar por tempo. (Oposto do Oikos, onde reverter break p/ OPEN é seguro; aqui adivinhar identidade não é.) Possível porque o consumidor segue com IUP nulo sem pressa.
+
+### Auditoria e idempotência
+
+- **Landing zone imutável**: o texto bruto original do custodiante é guardado por hash de conteúdo (mesma filosofia do `raw_imports` do Oikos, ADR-0002/0012), permitindo rerodar extratores melhorados sobre o bruto quando a Camada 1 evoluir com amostras.
+  - **Dois grãos de âncora (decidido):** (1) **file-hash** do import imutável — estável para **todo** custodiante (bytes nunca mudam), serve lineage + no-op de reingestão exata; (2) **âncora sub-arquivo = par `(extractor_version, source_locator)`, NÃO um hash** — endereço estrutural no bruto, fornecido pelo extrator versionado por custodiante. **BTG agora:** locator = ISIN / índice do elemento `FinInstrmId` (cristalino). **Texto caótico:** locator é span best-effort e o re-find vira **candidato para o HITL, nunca automático**. O esquema geral de `source_locator` fica **deferido** à fatia de extrator por custodiante (bloqueada por amostra — ver `detect_source`); não se congela um hash de slice ruidoso agora.
+  - **Invariante (ADR-0006):** âncora de conteúdo é **re-find intra-fonte só**. **Unificação cross-custodiante é alias/merge (surrogate, ADR-0004), nunca o hash** — mesmo ativo em dois custodiantes gera slices/hashes diferentes por construção.
+- **Resolução idempotente**: reingestão de conteúdo idêntico é no-op de identidade — nunca cunha IUP novo nem duplica alias para um ativo já resolvido. Para chave forte, o no-op vem do **unique parcial** em `chave_sintetica` (ADR-0004). Para itens HITL (chave NULL), o re-find ancora na **landing zone**: file-hash + `(extractor_version, source_locator)` — automático no caso estruturado (BTG), HITL-surfaced no caso ruidoso (ver Landing zone).
+- **Decisões de HITL persistidas**: re-run reaproveita a decisão humana (não re-pergunta); reversão é sempre explícita e logada.
+- **Re-extração com extrator melhorado**: decisão humana é **pegajosa** — re-extração **nunca** sobrescreve IUP confirmado por humano; só abre **item de revisão** (discrepância) para HITL. Itens **auto-resolvidos** (sem humano) podem ser atualizados direto. **Extração versionada** (modelo + versão por campo) para auditoria e para reprocessar em massa quando o modelo melhora.
+
+### Storage (divergente da spec original — ver ADR-0001)
+
+- **Postgres**: registro autoritativo de IUP + aliases + **fila de pendências (`pending_resolution`)** + auditoria (system of record, concorrente, durável, alinhado ao Oikos). A `pending_resolution` é **store separado que nunca guarda IUP** — só a chave provisória, o payload bruto extraído, `motivo`, `status` e `created_at`; é o que lastreia `GET /pending`. O `thread_id` do LangGraph entra depois como **coluna** dessa tabela, não como motivo para adiá-la.
+- **DuckDB / Polars**: parsing e transformação em memória (não são system of record).
+- **LangGraph PostgresSaver**: checkpoints do grafo (estado pausado no HITL) durável no mesmo Postgres — alinhado ao system of record (ADR-0001), sobrevive a restart. (Diverge do `SqliteSaver` da spec — mesma razão da divergência de storage do ADR-0001.) Pool psycopg lazy, `setup()` no lifespan.
+
+## Integração com o Oikos (ver ADR-0001 + ADR-0015 do Oikos)
+
+**REST API versionada, sem DB compartilhado** (preserva independência dos dois produtos):
+
+- Direção (b) — Oikos ingere sozinho: `POST /resolve-iup` (Oikos envia dados do ativo → recebe IUP) e segue com caixa/reconciliação.
+- Direção (a) — AssetBridge ingere: entrega **posições/ativos com IUP + lançamentos de caixa normalizados (pass-through)** que o Oikos ingere via endpoint dedicado e usa para a reconciliação completa (caixa + AUM + NAV).
+- Assíncrono via `thread_id`, como ambos já operam.
+
+**Reimport = ownership de ingestão, por fonte.** Cada lado reimporta seu próprio store, sobre seu próprio bruto; nenhum alcança o store do outro (ADR-0001). Duas operações distintas: **restate de posição** (arquivo re-entregue; dono = quem ingeriu as posições — ex. Oikos na direção b, via `reimport_position_file`) e **re-extração de identidade** (extrator melhorado sobre os mesmos bytes; dono = **sempre o AssetBridge**, autoridade do IUP — exige reter sua **própria** cópia do bruto que resolveu). Gatilho interno do AssetBridge: HITL reclassifica `log_excluded → instrumento` (ADR-0005) → AssetBridge re-roteia e re-entrega a posição. **Não cascateia automático:** reimport do AssetBridge **não** atualiza o Oikos sozinho — precisa de **entrega explícita + sinal de versão/staleness** por `(carteira, asof)`, senão o Oikos opera com projeção stale sem saber (decisão silenciosa — proibida). Oikos, ao receber, roda seu `reimport_position_file` no `(fund, date)` afetado + re-reconcilia. **O contrato de entrega (push/pull, versionamento, sinal de staleness) ainda está aberto** — ver "Contrato/integração".
+
+**Dois modos de entrada, um caminho de resolução:** `resolve-iup` aceita payload **híbrido** — campos fortes opcionais (classe, CNPJ, vencimento, série, subordinação) + `raw_description` opcional. A **extração é condicional**: o engine só roda Camada 1 (regex + LLM) sobre o que faltar; a resolução sempre roda. Oikos manda dado estruturado (do XML BTG) → IUP **determinístico, sem LLM**. Custodiante novo manda texto bruto → Camada 1 completa.
+
+**Resposta híbrida sync/pending:** match exato de chave forte completa → resposta **síncrona** com o IUP na hora. Caso ambíguo (LLM/HITL) → `pending` + `thread_id`; consumidor faz poll (`GET /status/{thread_id}`) ou recebe webhook e **backfilla** o IUP. O Oikos nunca trava: guarda IUP nulo e preenche na resolução. **Trade-off aceito:** duas formas de resposta e um fast-path síncrono por fora do grão (thread/checkpoint) do grafo, em troca de latência baixa no caso comum (BTG estruturado).
+
+## Estado da implementação (MVP atual)
+
+Construído por TDD (red-green), **escopo BTG-only, identidade + posição**, com o stack-alvo adotado de forma antecipada (ADR-0012). **99 testes verdes** rodando contra Postgres real em Docker.
+
+### O que já existe (`src/assetbridge/`)
+
+- **`identity.py`** — `AssetIdentity` (campos fortes: `tipo`, `data_vencimento`, `isin`, `cnpj_emissor`, `serie_emissao`, `is_subordinado`); `chave_sintetica` (usa ISIN quando presente, senão compõe pelos campos do texto); `tem_chave_forte` (ISIN ou CNPJ); `rotulo_semantico` (config-driven por classe — `ClassRules` ainda como dict de builders); `Resolution` (resolved | pending).
+- **`registry.py`** — `IupRegistry.resolve`: guard HITL (sem chave forte → `pending`) → lookup por chave → cunha **IUP surrogate opaco** (`IUP-<uuid>`). Idempotente. Postgres é o system of record.
+- **`db.py`** — tabela `iup_registry`. Sem Alembic ainda (schema via `create_all`). **Decidido (ADR-0004):** PK **surrogate `id`**; `chave_sintetica` **nullable** com **unique parcial** (`WHERE NOT NULL`) — chave forte dedupa pelo unique, IUP de HITL fica com chave NULL e só é alcançável por surrogate/alias. `iup` único, `created_at`. **Decidido:** `rotulo_semantico` **deixa de ser coluna** — derivado/recalculável, ninguém referencia; recalcula **on read**.
+- **`parser_btg.py`** — dois parsers do XML BTG (ISO 20022 `semt.003.001.04`):
+  - `parse_carteira` / `parse_ativos` (stdlib `xml.etree`): extração de identidade para o path standalone (resolve IUP por ativo). Roteamento três-vias (ADR-0005): instrumento forte → IUP; sem chave → HITL; não-instrumento → exclusão auditada.
+  - `parse_position_xml` (lxml): parser completo de posição — retorna `ParsedFundPosition` com dados do fundo (CNPJ, nome, NAV, AUM reportado, quota quantity, payables/receivables), lista de `ParsedPosition` (instrumento + qty + preço + holding) e lista de `ParsedBalanceBreakdown`. Espelha o parser do oikos-testes (`ADR-0019`); MARGEM BTG embutida como posição sintética negativa explícita.
+- **`api.py`** — FastAPI: `POST /resolve-iup` (contrato ADR-0008: payload `{isin, cnpj, description, cvm_classification}` → `{status: resolved|pending, iup, ...}`) e `POST /ingest` (body XML BTG → **ciclo completo direção a**, ver `ingest.py`). Inclui os routers de **registry de fontes** (`source_registry.router`) e **acervo/browse** (`catalog.router`).
+- **`ingest.py`** — orquestra a direção a (standalone) do XML BTG: landing zone por hash (**no-op se duplicado** — `status='duplicate'`, ADR-0008), roteamento três-vias das posições (ADR-0005: chave forte → cunha/casa IUP; sem chave forte → posição com IUP nulo + pendência HITL; posição **sintética** MARGEM/`BBDN` injetada pelo parser → **exclusão auditada** `excluded_log`, fora do HITL) e projeção de posição com delete+replace por `(id_carteira, custodiante, asof)` via `upsert_posicoes`. Devolve contadores (`posicoes`/`pendencias`/`excluidos`) + o parse. `id_carteira = fund_cnpj`. **É o que a tela de Upload do Acervo alimenta** — popular Acervo (assets/positions/pending) de verdade.
+- **`source_registry.py`** — registry de fontes de enriquecimento (ADR-0011): tabela `source_config` + `GET/POST/PATCH/DELETE /sources`. `build_db_sources` monta `HttpEnrichmentSource` por linha `enabled` de `tipo='api'` (csv/scraping catalogados, execução deferida — ADR-0010); `ChainEnrichmentSource` encadeia N fontes best-effort. `hitl.get_graph` compõe a fonte env (CVM) + as do registry, lidas por request (cadastrar/ligar reflete sem restart).
+- **`catalog.py`** — superfícies read-only do que já foi injetado (item browse): `GET /assets` (IUPs cunhados), `GET /positions` (projeção de posição) e `GET /imports` (landing zone — metadados de lineage, nunca os bytes brutos).
+- **`analytics.py`** (ADR-0012, fatia 2) — analytics colunar sobre a projeção `positions`: `posicoes_frame` carrega num DataFrame **Polars**; `resumo_por_carteira` roda o SQL agregado (Σ qtd·pu, contagem por carteira/asof) no **DuckDB** via replacement scan. Camada DERIVADA read-only — Postgres segue autoritativo; `pu` nulo conta 0 mas a posição é contada (nada some, ADR-0005).
+- **`harness.py`** (ADR-0012, fatia 3) — harness de carga sobre **carteiras BTG reais** (não 300 sintéticas): `gerar_carteiras_btg` replica um template BTG em N carteiras distintas (CNPJ de fundo variado → hash distinto, sem dedup); `rodar_carga` roda o pipeline (`ingest_btg`) medindo throughput + invariantes (`LoadReport`: posições/pendências/exclusões/duplicados/throughput). Prova idempotência sob carga (reingestão = no-op, ADR-0008).
+- **`matching.py`** (ADR-0012, fatia 4) — matching da Camada 2 por similaridade: `VectorMatcher` (índice **Faiss** `IndexFlatIP` sobre vetores normalizados = cosseno) via porta `Embedder` (fake no teste; modelo real depois). Para ativo sem chave forte, sugere os IUPs mais parecidos (`MatchCandidate`) como **AID do HITL** — NÃO-autoritativo, **nunca auto-liga identidade** (fronteira ADR-0007/0010); puro, não escreve no `iup_registry`.
+
+### Stack presente vs. spec
+
+- **Presente:** FastAPI · Pydantic · SQLAlchemy · psycopg/**Postgres** · lxml · **Polars · DuckDB · pyarrow** (analytics colunar, `analytics.py`) · **Faiss · numpy** (matching vetorial Camada 2, `matching.py`) · LangGraph · langchain-ollama · pytest (+ httpx).
+- **Adotado de forma antecipada (ADR-0012, supera 0002):** langchain_ollama/LLM, DuckDB, Polars, Faiss/Chroma e **harness de carteiras BTG** (substitui as 300 sintéticas da spec) — gatilho: amostra real + derisk do pipeline ponta-a-ponta + demo. Cada peça ainda entra **com teste** (TDD). Frontend já adotado (ADR-0009). Fronteiras de não-determinismo (ADR-0007/0010) seguem intactas.
+- **Entregue (ADR-0010):** **LangGraph** (antecipado) como grafo `extract → resolve_identity → enrich_web → deliver`, ativado pela fatia de **enriquecimento web**.
+- **Entregue (ADR-0011):** **registry de fontes cadastrável** (`source_config` + `/sources` CRUD) — operador cadastra fonte-`api` pela UI e liga vivo no grafo sem env/código; csv/scraping catalogados com execução deferida. **Acervo read-only** (`/assets`,`/positions`,`/imports`) para inspecionar o que foi injetado.
+
+### Containers / como rodar
+
+- `docker-compose.yml`: **`db`** (postgres:16-alpine, **efêmero de propósito** — sem volume; schema via `create_all`, sem Alembic ainda) + **`test`** (pytest) + **`api`** (uvicorn, host `8001`, schema via lifespan `create_all`) + **`frontend`** (Next.js dev, host `3001`) + **`frontend-test`**. Docs interativas da API em `http://localhost:8001/docs` (Swagger) / `/redoc`.
+- Testes backend: `docker compose run --rm test` · Testes frontend: `docker compose run --rm frontend-test`
+- **Deps Python entram no build da imagem** (`pip install` no Dockerfile, não em volume): ao mexer em `pyproject.toml`, rode `docker compose build` antes de `run`/`up`.
+- Isolamento de teste: **rollback de transação** por teste (sem TRUNCATE/DROP/DELETE).
+
+### Grafo, extração e enriquecimento (ADR-0010/0012 — entregue)
+
+- **Grafo LangGraph + enriquecimento web.** Esqueleto `extract → resolve_identity → enrich → deliver` (`graph.py`) envolvendo as funções determinísticas atuais. Nó `enrich` via **porta `EnrichmentSource`** (fake no teste; conectores oficiais/web depois). Tabela `enrichment` não-autoritativa. Fronteira em teste: característica → `enrichment`; campo forte da web → candidato `pending_resolution`; falha da fonte → entrega sem enrich (best-effort).
+- **Nó `extract` (Camada 1 híbrida — fronteira do ADR-0007).** `extraction.py`: regex genérico (ISIN/CNPJ/data — formatos padronizados, **não** específicos de custodiante) manda nos campos fortes; **porta `FieldProposer`** (LLM, fake no teste) só propõe fuzzy e **nunca** preenche campo forte (`STRONG_FIELDS`). `FieldProposal` carrega `modelo` (extração versionada). No grafo: texto bruto → `extract`; identidade já estruturada (BTG direção b) → passthrough. **Versionamento persistido (ADR-0012, fatia 1):** `registrar_extracao` faz **upsert** de `ExtractionRecord` (raw_hash + campo + valor + `modelo` + `confianca`, `iup` nullable) no `deliver`, único por `(raw_hash, campo, modelo)`. Re-extração com o **mesmo modelo sobrescreve** (mais recente vence — cobre não-determinismo do LLM e backfill do `iup` pós-HITL); **modelo novo versiona** (linha nova) — base do reprocessamento em massa, sem duplicatas. Adapter `OllamaProposer`/`build_ollama_proposer` (lazy) já existe e o **wiring está pronto**: `hitl._field_proposer` (gated por `ASSETBRIDGE_OLLAMA_MODEL`) injeta o proposer no `build_graph`; sem env → `None` → `extract` passthrough (sem rede). Serviço `ollama` no compose sob `profiles: ["llm"]` (não sobe em teste/`up` normal). **Deferido (bloqueado por amostra):** ligar o Ollama de fato, regex/prompts por custodiante, desambiguação venc×emissão, calibração de confiança.
+- **Conector oficial `HttpEnrichmentSource`** (`sources.py`): implementa a porta `EnrichmentSource` sobre HTTP (httpx), mapeia resposta→`EnrichmentResult` via `field_map` (config), `fonte="oficial"` (confiança alta), snapshot do registro, degrada gracioso (sem chave/404/erro de rede → `[]`). Testado com `httpx.MockTransport` (sem rede).
+- **`HybridEnrichmentSource`** (`sources.py`): composição oficial→web do ADR-0010 — oficial manda, web preenche **só as lacunas** com confiança **rebaixada ao teto `cap_web`**; web falha → só o oficial. Lógica completa e testada.
+- **`CvmCriSource` — conector oficial REAL (CVM dados abertos)** (`sources.py`): informe mensal de CRI (dataset `securit-doc-inf_mensal_cri`), tabela `classe`. **Achado verificado (2026-06-17):** a tabela tem coluna `Codigo_ISIN` → **joina direto pelo ISIN do BTG** (não precisa de bridge). `load_cvm_cri_classe_index` parseia o CSV real (latin-1, `;`) e indexa por ISIN (linha mais recente por `Data_Referencia`/`Versao`); `field_map` real: `Classificacao_Risco_Atual→rating`, `Nivel_Subordinacao→subordinacao`, `Taxas_Indexadores→indexador`, `Situacao→situacao`, `Classe→classe_cvm`. Validado no dado real (4731 ISINs, 1818 com rating). **Limite:** `Codigo_ISIN` da CVM é irregular (nem todo código é ISIN 12-char) → match depende da qualidade do dado, degrada gracioso. CRA/debêntures = mesma forma, outro dataset.
+- **Camada de ops `CvmCriCache`** (`cvm_ops.py`): baixa o zip anual da CVM (httpx), extrai a tabela `classe`, **cacheia o CSV em disco** e reconstrói o índice; **refresh por TTL** (default 7d, CVM atualiza ~semanal) ou `force`. `fetch_zip` injetável (testes sem rede). **Wiring no app:** `hitl._enrichment_source()` é config-gated — com env `ASSETBRIDGE_CVM_CRI_CACHE_DIR` usa o `CvmCriSource` vivo no grafo; sem env → `_NullSource` (default seguro, sem rede em teste). Provado end-to-end contra a CVM real (4731 ISINs). **Deferido:** refresh in-process sem restart; download por ano corrente only (anos anteriores não combinados).
+- **`OllamaProposer`** (`proposers.py`): adapter da porta `FieldProposer` sobre `ChatOllama.with_structured_output(FuzzyExtraction)` — saída estruturada Pydantic só com campos **fuzzy** (classe/série/subordinação); nunca campo forte (ADR-0007), marca `modelo` (versionamento). Factory `build_ollama_proposer` importa `langchain_ollama` lazy (testes usam modelo fake). **Deferido (bloqueado por amostra/host):** modelo real `qwen3:14b` num host com VRAM, prompts/few-shot por custodiante, calibração de confiança.
+- **HITL no fluxo do grafo (`thread_id` + checkpoint + `interrupt_before`).** Com `checkpointer` injetado, o grafo ganha o nó `hitl` atrás de edge condicional: item ambíguo (sem chave forte) → `interrupt_before(["hitl"])` **pausa antes de cunhar o IUP**, persiste o estado por `thread_id` e o grava como **coluna** na `pending_resolution`; o `resume` (`update_state` com a `decisao` humana → `invoke(None)`) retoma e cunha via `cunhar_hitl`. Chave forte → auto-cunha inline, sem pausa. `checkpointer` é injetável (`MemorySaver` no teste; **`SqliteSaver` como swap durável no MVP** — ainda não plugado). Sem `checkpointer` o grafo roda linear (comportamento anterior preservado).
+
+### Lacunas conscientes do que está implementado
+
+- Resolução **não** persiste ainda a `chave_sintetica_provisoria` separada do IUP nem a **alias table** (só a tabela `iup_registry`). Merge/alias é fatia futura.
+- `pending` **persiste na `pending_resolution`** (decidido: HITL é função central, `GET /pending` já está no contrato). O `thread_id` **já é coluna** e o checkpoint/`interrupt_before` existem no grafo. **`POST /pending/{id}/decision` já retoma o grafo** por `thread_id` (resume hitl→enrich→deliver via `_CHECKPOINTER` do app); pendência sem `thread_id` (fora do grafo) cai no `cunhar_hitl` direto. **`GET /status/{thread_id}`** fecha o poll do contrato sync/pending (ADR-0008): `pending`→IUP nulo (nunca trava), `resolved`→IUP p/ o consumidor backfillar; thread desconhecido → 404. O checkpointer é **`PostgresSaver` durável** (pool psycopg lazy, `setup()` no lifespan): o estado pausado no HITL sobrevive a restart do processo e a múltiplos workers — provado por teste que retoma o thread numa **instância nova** do saver.
+- **`/ingest` fecha o ciclo direção a (entregue, 2026-06-17 — `ingest.py`):** resolve/cunha IUP por posição, projeta a posição (delete+replace `(id_carteira, custodiante, asof)`), enfileira HITL o que não tem chave forte e audita a sintética — popular Acervo (assets/positions/pending) de verdade. O **modelo interno de posição** (qty, PU/valor, `asof` + `id_carteira`/`custodiante`) é `PositionRecord` (`db.py`) gravado por `upsert_posicoes`. **Escopo (ownership de ingestão):** a projeção de posição do AssetBridge existe **só para as fontes que o AssetBridge ingere** (direção a). Para BTG via **direção b** (Oikos ingere e só chama `/resolve-iup`), **o Oikos guarda as posições**; o AssetBridge guarda o bruto **só para re-extração de identidade**. O `/ingest`+`parser_btg` atual é a **capacidade da direção a**, não uma posse global das posições BTG.
+  - **Time series, delete+replace por dia (alinhado ao Oikos):** o Oikos guarda `positions` com unique `(fund_id, instrument_id, reference_date)` — uma linha por fundo/instrumento/dia; query entre datas = histórico completo. Reimport (`reimport_position_file`) busca bytes do `raw_imports`, re-parseia e **deleta+reinsere todas as posições de `(fund_id, reference_date)`** — a tabela de posição é **projeção derivada** (imutabilidade vive no `raw_imports`/landing zone, não na posição), então delete+replace é correto e simples (sem versionamento de linha).
+  - **Idempotência:** ingest normal bloqueia file-hash duplicado → `"duplicate"`; o **reimport explícito bypassa o gate** e sobrescreve só o slice do dia. Outras datas / outros fundos intactos.
+  - **Ponte de terminologia (Carteira ≠ fundo):** store interno do AssetBridge chaveia por `(id_carteira, custodiante, IUP, asof)` — delete+replace por `(id_carteira, custodiante, asof)`, espelhando a regra de dia do Oikos no **grão de carteira**. Na entrega, o Oikos faz de-para `carteira → fund_id (CNPJ)` e `IUP → instrument_id` e aplica seu próprio delete+replace por `(fund_id, instrument_id, reference_date)`. Duas carteiras → um fundo: o colapso é lógica do Oikos, não do AssetBridge.
+- **Landing zone imutável a construir junto** (raw por hash de conteúdo, CONTEXT acima): a posição interna fica ao lado do bruto. Versionamento de extração ainda deferido.
+
+## Em aberto / perguntas a grilhar (com motivo)
+
+A arquitetura macro está fechada (ver acima + ADR-0001). O que falta **não foi resolvido de propósito** — cada item abaixo diz **por que** ficou em aberto.
+
+### Bloqueado por dado real (não decidir antes de ter amostra)
+
+- **Camada 1 — regex e prompts por custodiante.** *Motivo:* não há amostras reais de custodiantes não-BTG. Calibrar regra de extração sem ver o texto é chute; esperar 1–2 amostras reais. **Este é o próximo passo concreto do projeto.** Inclui `is_instrument` por custodiante e a tabela CVM→classe (ADR-0005): config aprendida por amostra, não hardcode; até lá, custodiante novo colapsa em HITL (bootstrap).
+- **Limiares de confiança / zona cinzenta do HITL** (ex: 0.75–0.90) e score de confiança do LLM. *Motivo:* sem dado rotulado (gerado pelo HITL conservador ao longo do uso) qualquer limiar é arbitrário.
+- **Detecção de custodiante / roteamento de extrator** (equivalente ao `detect_source`). *Motivo:* depende de conhecer os formatos reais — só com amostra.
+
+### Implementação (decidir ao codar, não é decisão de domínio)
+
+- **Schema concreto do payload `resolve-iup`** (campos exatos de request/response). *Motivo:* a forma macro está decidida (híbrido, sync/pending); o detalhe de campos sai naturalmente no código.
+- **Modelo de transação (pass-through) — resolvido contra o schema do Oikos.** Tabela `transactions`: `fund_id`, `raw_import_id`, `reference_date`, `account`, `fund_structure`, `entry_type` (saldo inicial/depósito/aquisição/saldo final…), `amount`, `balance`. **Sem unique no DB**; dedup no service por skip-if-exists `(fund_id, reference_date, entry_type, amount)`. **Sem coluna `iup` nem `instrument_id`** — e é assim que deve ser:
+  - **IUP single-sourced em `instrument.iup`.** Posições alcançam via FK `instrument_id`; **transações alcançam só pela cadeia de posição via reconciliação do Oikos** (casa `aquisição`+amount contra posição do `fund/date`). **Não** se denormaliza IUP nas linhas de caixa/posição — mesmo princípio anti-drift do `rotulo_semantico` (Q3).
+  - **Cash pass-through do AssetBridge não carrega IUP.** AssetBridge normaliza estrutura (`entry_type/amount/balance/reference_date/account`) e entrega; associação de caixa↔ativo é **reconciliação do Oikos**, não atribuição do AssetBridge. "Anexar IUP onde aplicável" = **posições**, não lançamentos.
+  - **Backfill:** resolver pendência → atualiza `instrument.iup` **uma vez** → posições herdam por FK, transações por recon. Transação **nunca bloqueia** em IUP pendente (`saldo_inicial + Σlançamentos = saldo_final` precisa do dia inteiro). Espelha o sync/pending do ADR-0015.
+  - **BTG cash = extrato diário completo** (um arquivo/dia/todos os fundos; saldo inicial+final só coerentes como estado de dia inteiro). Logo **reimport = delete+replace por `(fund_id, reference_date)`** — mesma regra de posições — **se** adicionado. Hoje: skip-if-exists (append) + bloqueio por file-hash; **não há** `reimport_transaction_file` ainda.
+- **Geração do token opaco do IUP** (UUID vs prefixo+token, garantia anti-colisão). *Motivo:* detalhe de implementação; só ficou cravado que é opaco e imutável.
+- **Mecânica do de-para carteira → fundo** (tabela, chave por CNPJ). *Motivo:* conceito decidido (carteira≠fundo, resolve por CNPJ no BTG); a tabela é implementação.
+
+### Fase de UI (depois do MVP API-first)
+
+- **Backoffice próprio do HITL — tecnologia e estrutura decididas (ADR-0009).** Frontend **Next.js** (App Router, TypeScript, PT-BR) em **monorepo** (`frontend/`), cliente **fino** dos endpoints HITL — nenhuma regra de identidade no front; soberania do IUP fica no backend. Operadores **mistos** (técnico via CLI/API + analista via Web UI), todos **internos** do AssetBridge (delegar a decisão ao consumidor inverteria a autoridade do IUP). **Scaffold entregue:** Fila HITL + Resolver lastreadas por `GET /pending` e `POST /pending/{id}/decision` (reais). **Stub consciente:** Painel/métricas, Detalhe rico (série temporal/IUP candidato) e Histórico de de-para (`/merge`, `/merge/{id}/revert`) ficam marcados como pendentes até o backend expor o dado — não simulados como prontos. **Telas reais entregues (2026-06-17):** **Acervo** (`/acervo`, Server Component read-only — imports/posições/IUPs via `/assets`+`/positions`+`/imports`) com **Upload de import** embutido (client component `acervo/uploader.tsx` → `enviarIngest` → `POST /ingest` com o XML BTG cru no body + `X-File-Name`; `router.refresh()` recarrega o acervo; parse/cunho de IUP seguem do backend, front é só transporte) e **Fontes** (`/fontes` — registry CRUD do ADR-0011; cadastro de fonte-api liga vivo sem env/código, csv/scraping cadastráveis com execução deferida). Cliente fino em `lib/api.ts`, testado em vitest. **`next` em `^15.5.19`** (upgrade de 15.1.6 por CVE-2025-66478, 2026-06-17).
+
+### Contrato/integração compartilhado com o Oikos
+
+**Decidido (ADR-0008 + ADR-0019 do Oikos):**
+
+- **Direção B para BTG confirmada.** Oikos ingere com parsers próprios e chama `POST /resolve-iup` apenas para obter o IUP. AssetBridge recebe campos estruturados (ISIN, CNPJ, `cvm_classification`, descrição) — não o XML bruto. `parser_btg.py` do AssetBridge permanece para direção a em outros custodiantes.
+- **Disponibilidade via `ASSETBRIDGE_URL`.** Se a env var não está configurada no Oikos, o AssetBridge é considerado indisponível; `instrument.iup = null`. Nenhum health check periódico.
+- **Degradação graciosa.** Timeout (5s) ou erro de rede → Oikos continua com `iup = null`; ingest nunca bloqueia. `pending` é resposta legítima, não erro.
+- **Backfill por instrumento — pull (decidido).** O Oikos (`POST /imports/backfill-iup`) re-resolve instrumentos com `iup IS NULL` e chave forte contra `/resolve-iup` (idempotente). O AssetBridge não faz push nem precisa conhecer a URL/auth do Oikos; só garante que `/resolve-iup` retorne `resolved` após o HITL. Quando resolvido, Oikos atualiza `instrument.iup` uma vez; posições herdam por FK. Transações não carregam IUP diretamente.
+
+**Ainda em aberto:**
+
+- **Push via webhook** (alternativa ao pull). *Motivo:* só entra se a latência do pull for insuficiente; exigiria auth service-to-service e a URL do Oikos.
+- **Autenticação service-to-service.** *Motivo:* o Oikos não tem auth no MVP (ADR-0008 do Oikos — a criar); decidir junto com a auth do Oikos.
+- **Versionamento do contrato REST** (`/v1` vs header). *Motivo:* só vira concreto no primeiro consumidor real em produção.
+- **Contrato de entrega posições+caixa normalizados com IUP (direção a)** — schema do endpoint, sinal de staleness por `(carteira, asof)`, gatilho de re-reconciliação no Oikos. *Motivo:* concretiza quando houver primeiro custodiante externo real (não BTG).
+
+### Teste / performance (artefato, não domínio)
+
+- **Harness de stress de 300 carteiras concorrentes.** *Motivo:* é script de teste, não decisão de design; muda em relação à spec (Postgres no lugar de SQLite in-memory) e se escreve quando houver o pipeline rodando.

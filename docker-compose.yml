@@ -1,0 +1,107 @@
+services:
+  # db EFÊMERO de propósito (sem volume de dados): schema vem de create_all e
+  # NÃO há Alembic ainda — volume persistente + create_all causaria drift de
+  # schema (tabela velha sobrevive sem constraints novos). `down` zera tudo.
+  # Quando entrar migration, aí sim adicionar volume p/ persistir dados de dev.
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ab}
+      POSTGRES_DB: ${POSTGRES_DB:-assetbridge}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ab} -d ${POSTGRES_DB:-assetbridge}"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # NOTA: as deps Python entram via `pip install` no build da imagem (Dockerfile),
+  # não por volume. Ao mexer em pyproject.toml (ex.: polars/duckdb/faiss/numpy),
+  # rode `docker compose build` antes — `run`/`up` reaproveitam a imagem antiga.
+  test:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # ACOPLAMENTO: se sobrescrever POSTGRES_USER/PASSWORD/DB, sobrescreva
+      # DATABASE_URL junto — Compose não interpola ${} aninhado, então este
+      # default NÃO acompanha as POSTGRES_* automaticamente.
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://ab:ab@db:5432/assetbridge}
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./conftest.py:/app/conftest.py
+    command: pytest -q
+
+  # API FastAPI servida por uvicorn (modo standalone, direção a + resolve-iup).
+  # Schema criado no startup via lifespan (create_all idempotente).
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Mesmo acoplamento do serviço test: sobrescreveu POSTGRES_* → sobrescreva DATABASE_URL.
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://ab:ab@db:5432/assetbridge}
+      # Liga o conector CVM vivo (CvmCriSource via CvmCriCache). Sem esta var,
+      # o app cai no _NullSource (sem enriquecimento, sem rede).
+      ASSETBRIDGE_CVM_CRI_CACHE_DIR: ${ASSETBRIDGE_CVM_CRI_CACHE_DIR:-/var/cache/assetbridge/cvm}
+      ASSETBRIDGE_CVM_CRI_TTL_DAYS: ${ASSETBRIDGE_CVM_CRI_TTL_DAYS:-7}
+      # Extrator fuzzy (LLM). DESLIGADO por default: MODEL vazio → _field_proposer
+      # devolve None e o nó `extract` é passthrough. Para ligar: suba o serviço
+      # ollama (`docker compose --profile llm up`), puxe o modelo e sete MODEL,
+      # ex.: ASSETBRIDGE_OLLAMA_MODEL=qwen3:8b.
+      ASSETBRIDGE_OLLAMA_BASE_URL: ${ASSETBRIDGE_OLLAMA_BASE_URL:-http://ollama:11434}
+      ASSETBRIDGE_OLLAMA_MODEL: ${ASSETBRIDGE_OLLAMA_MODEL:-}
+    volumes:
+      - ./src:/app/src
+      - cvm_cache:/var/cache/assetbridge   # cache do zip CVM persiste entre restarts
+    ports:
+      # Host 8001 (8000 é do stack Oikos vizinho); porta interna segue 8000.
+      - "${API_HOST_PORT:-8001}:8000"
+    command: uvicorn assetbridge.api:app --host 0.0.0.0 --port 8000 --reload
+
+  # Frontend backoffice HITL (ADR-0009). Build + testes em container,
+  # sem depender de Node no host.
+  frontend-test:
+    build:
+      context: ./frontend
+    command: sh -c "npm run build && npm run test"
+
+  # Frontend dev server (hot reload). Server-side (Server Components) fala com a
+  # API pela rede do compose (http://api:8000); o fetch client-side do browser
+  # cai no default http://localhost:8000 (porta publicada pela service api).
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      - api
+    environment:
+      ASSETBRIDGE_API_URL: ${ASSETBRIDGE_API_URL:-http://api:8000}                       # server-side (rede compose)
+      NEXT_PUBLIC_ASSETBRIDGE_API_URL: ${NEXT_PUBLIC_ASSETBRIDGE_API_URL:-http://localhost:8001}  # browser (host)
+      WATCHPACK_POLLING: "true"   # inotify não propaga em bind mount Windows → polling
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      # Host 3001 (3000 é do frontend Oikos vizinho).
+      - "${FRONTEND_HOST_PORT:-3001}:3000"
+    command: npm run dev
+
+  # Runtime do LLM (servidor Ollama; ChatOllama é só o cliente). NÃO sobe nos
+  # testes nem no `up` normal — só com `docker compose --profile llm up`. Deferido
+  # até amostra real (ADR-0012); o wiring (env + _field_proposer) já está pronto.
+  # Depois de subir: `docker compose exec ollama ollama pull qwen3:8b`.
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["llm"]
+    volumes:
+      - ollama_models:/root/.ollama   # modelos baixados persistem entre restarts
+    ports:
+      - "${OLLAMA_HOST_PORT:-11434}:11434"
+
+volumes:
+  frontend_node_modules:
+  cvm_cache:
+  ollama_models:
