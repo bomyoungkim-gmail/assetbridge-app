@@ -127,6 +127,7 @@ Construído por TDD (red-green), **escopo BTG-only, identidade + posição**, co
 - **Adotado de forma antecipada (ADR-0012, supera 0002):** langchain_ollama/LLM, DuckDB, Polars, Faiss/Chroma e **harness de carteiras BTG** (substitui as 300 sintéticas da spec) — gatilho: amostra real + derisk do pipeline ponta-a-ponta + demo. Cada peça ainda entra **com teste** (TDD). Frontend já adotado (ADR-0009). Fronteiras de não-determinismo (ADR-0007/0010) seguem intactas.
 - **Entregue (ADR-0010):** **LangGraph** (antecipado) como grafo `extract → resolve_identity → enrich_web → deliver`, ativado pela fatia de **enriquecimento web**.
 - **Entregue (ADR-0011):** **registry de fontes cadastrável** (`source_config` + `/sources` CRUD) — operador cadastra fonte-`api` pela UI e liga vivo no grafo sem env/código; csv/scraping catalogados com execução deferida. **Acervo read-only** (`/assets`,`/positions`,`/imports`) para inspecionar o que foi injetado.
+- **LLM real LIGADO (ADR-0013, 2026-06-17):** extração fuzzy via Ollama ativada com **`qwen3:8b`** (`ASSETBRIDGE_OLLAMA_MODEL` no `.env`; serviço `ollama` no profile `llm`, modelo puxado). Gate em `hitl._field_proposer`: env setada → `OllamaProposer` no nó `extract`; vazia → passthrough (default seguro, sem rede — testes não tocam Ollama). Invoke real verificado e2e; fronteira ADR-0007 intacta (LLM só fuzzy, regex manda no forte). Liga/desliga = só a env. Subir p/ qwen3:14b (host com VRAM) é troca de env, sem código.
 
 ### Containers / como rodar
 

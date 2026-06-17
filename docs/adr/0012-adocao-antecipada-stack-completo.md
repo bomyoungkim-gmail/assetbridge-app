@@ -53,8 +53,8 @@ Mapa atualizado:
 
 **Deps adicionadas:** `polars`, `duckdb`, `pyarrow`, `faiss-cpu`, `numpy`.
 
-**Wiring do LLM real pronto, execução gated por env (fatia 1+):** o serviço `ollama` está no compose sob `profiles: ["llm"]` (não sobe em teste/`up` normal); `hitl._field_proposer` liga o `OllamaProposer` no nó `extract` quando `ASSETBRIDGE_OLLAMA_MODEL` está setado, senão `None` → passthrough (default seguro, sem rede). Faiss/DuckDB/Polars são libs in-process (sem serviço); só o LLM exige runtime à parte.
+**LLM real LIGADO em 2026-06-17 (modelo via env — ADR-0013):** o serviço `ollama` está no compose sob `profiles: ["llm"]` (não sobe em teste/`up` normal); `hitl._field_proposer` liga o `OllamaProposer` no nó `extract` quando `ASSETBRIDGE_OLLAMA_MODEL` está setado, senão `None` → passthrough (default seguro, sem rede). Ativado: `ASSETBRIDGE_OLLAMA_MODEL=qwen3:8b` no `.env`, serviço `ollama` no ar, modelo puxado; invoke real verificado e2e (LLM=fuzzy, regex=forte). Testes seguem com env vazia → passthrough (sem rede). Faiss/DuckDB/Polars são libs in-process (sem serviço); só o LLM exige runtime à parte.
 
-**Segue deferido (bloqueado por dado/amostra, não por decisão):** ligar o Ollama de fato (espera amostra real de texto caótico não-BTG), regex/prompts por custodiante, modelo de embeddings real, DTW/regressão (esperam série temporal de PU acumulada), calibração de limiares de confiança.
+**Segue deferido (bloqueado por dado/amostra, não por decisão):** regex/prompts por custodiante, modelo de embeddings real, DTW/regressão (esperam série temporal de PU acumulada), calibração de limiares de confiança.
 
 **Nota de infra (sem Alembic ainda):** o schema vem de `create_all`; o `db` do compose é **efêmero de propósito** — volume persistente + `create_all` causaria drift de schema (tabela velha sobrevive sem constraints novos). Adicionar volume de dados só quando entrar migration.
