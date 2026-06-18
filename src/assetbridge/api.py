@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -115,9 +116,15 @@ async def ingest(
     delete+replace. Retorna os contadores do ciclo + a posição parseada.
 
     Resolve cada posição pelo GRAFO (ADR-0010): pendência sem chave forte nasce
-    com `thread_id` (poll/resume) e o ativo identificado roda enrich/deliver."""
+    com `thread_id` (poll/resume) e o ativo identificado roda enrich/deliver.
+
+    O ciclo é sync e pesado (N `graph.invoke` + checkpoint durável por posição):
+    roda em threadpool (`run_in_threadpool`) p/ não bloquear o event loop sob
+    concorrência — o `await request.body()` segue async (BP da auditoria ln-511)."""
     xml = await request.body()
-    res = ingest_btg(session, xml, resolver=resolver_via_grafo(graph))
+    res = await run_in_threadpool(
+        ingest_btg, session, xml, resolver_via_grafo(graph)
+    )
     return {
         "source": "btg_position_xml",
         "file_name": x_file_name,
