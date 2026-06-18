@@ -29,3 +29,6 @@ coverage/
 Thumbs.db
 .vscode/
 .idea/
+
+# Skill/audit runtime artifacts (transient, run-scoped — not source)
+.hex-skills/
