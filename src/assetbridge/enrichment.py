@@ -5,8 +5,9 @@ from typing import Optional, Protocol, runtime_checkable
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from .db import EnrichmentRecord, PendingResolution
+from .db import EnrichmentRecord
 from .identity import AssetIdentity, chave_sintetica
+from .pending import enqueue_pending
 
 # Campos FORTES (identidade — ADR-0001/0007). A web pode SUGERIR um destes,
 # mas nunca aplica: vira candidato HITL. Tudo fora daqui é característica.
@@ -80,28 +81,10 @@ def _enfileirar_candidato(
 
     Guarda a sugestão + fonte no payload para o humano avaliar; o IUP segue
     determinístico (ADR-0007). Dedup pela chave provisória + campo sugerido."""
-    chave = chave_sintetica(ativo)
     motivo = f"campo forte '{r.campo}' sugerido pela web (fonte {r.fonte})"
-    ja = (
-        session.query(PendingResolution)
-        .filter(
-            PendingResolution.chave_provisoria == chave,
-            PendingResolution.status == "pending",
-            PendingResolution.motivo == motivo,
-        )
-        .first()
+    enqueue_pending(
+        session,
+        chave_sintetica(ativo),
+        {"ativo": ativo.model_dump(), "sugestao": r.model_dump()},
+        motivo,
     )
-    if ja is not None:
-        return
-    session.add(
-        PendingResolution(
-            chave_provisoria=chave,
-            payload={
-                "ativo": ativo.model_dump(),
-                "sugestao": r.model_dump(),
-            },
-            motivo=motivo,
-            status="pending",
-        )
-    )
-    session.flush()

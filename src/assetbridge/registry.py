@@ -5,7 +5,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .db import IupRecord, PendingResolution
+from .db import IupRecord
 from .identity import (
     AssetIdentity,
     Resolution,
@@ -13,6 +13,7 @@ from .identity import (
     rotulo_semantico,
     tem_chave_forte,
 )
+from .pending import enqueue_pending
 
 
 class IupRegistry:
@@ -71,25 +72,13 @@ class IupRegistry:
     def _enqueue_pending(
         self, ativo: AssetIdentity, motivo: str, thread_id: str | None = None
     ) -> None:
-        """Persiste a pendência na fila HITL (Q1). Dedup por chave provisória:
-        re-resolver o mesmo item não duplica a pendência aberta. Nunca grava IUP."""
-        chave = chave_sintetica(ativo)
-        ja_aberta = self._session.scalars(
-            select(PendingResolution).where(
-                PendingResolution.chave_provisoria == chave,
-                PendingResolution.status == "pending",
-            )
-        ).first()
-        if ja_aberta is not None:
-            return
-
-        self._session.add(
-            PendingResolution(
-                chave_provisoria=chave,
-                payload=ativo.model_dump(),
-                motivo=motivo,
-                status="pending",
-                thread_id=thread_id,
-            )
+        """Persiste a pendência na fila HITL (Q1) via o mecanismo único
+        `enqueue_pending`. Dedup por `(chave provisória, motivo)`: re-resolver o
+        mesmo item não duplica a pendência aberta. Nunca grava IUP."""
+        enqueue_pending(
+            self._session,
+            chave_sintetica(ativo),
+            ativo.model_dump(),
+            motivo,
+            thread_id,
         )
-        self._session.flush()
