@@ -10,8 +10,7 @@ import Uploader from "./uploader";
 
 // Acervo (item 4 / browse): o que já foi injetado. Server Component, read-only
 // — busca no backend a cada request (no-store). Espelha os endpoints de
-// catálogo (/assets, /positions, /imports). Visibilidade operacional enquanto
-// não há tela rica (ADR-0009 §5).
+// catálogo (/assets, /positions, /imports). Restyle ADR-0014.
 export default async function AcervoPage() {
   let ativos: Ativo[] = [];
   let posicoes: Posicao[] = [];
@@ -34,123 +33,174 @@ export default async function AcervoPage() {
   }
 
   return (
-    <section>
-      <h1>Acervo</h1>
-      <p>
-        O que já foi injetado no AssetBridge: imports na landing zone (bruto
-        imutável), projeção de posição (direção a) e IUPs cunhados (autoridade do
-        registro). Read-only.
-      </p>
+    <section aria-labelledby="h-acervo">
+      <div className="page-head">
+        <div>
+          <h1 id="h-acervo">Acervo</h1>
+          <p>
+            O que já foi injetado no AssetBridge: imports na landing zone (bruto
+            imutável), projeção de posição (direção a) e IUPs cunhados
+            (autoridade do registro). Read-only.
+          </p>
+        </div>
+      </div>
 
       {erro && (
-        <div className="stub">
+        <div className="stub" role="alert">
           Não foi possível carregar o acervo: {erro}. Confira{" "}
           <code>ASSETBRIDGE_API_URL</code> e se o backend está no ar.
         </div>
       )}
 
-      <h2>Enviar import</h2>
-      <Uploader />
+      <div className="panel">
+        <header>
+          <h2>Enviar import</h2>
+        </header>
+        <div style={{ padding: "1rem" }}>
+          <Uploader />
+        </div>
+      </div>
 
-      <h2 style={{ marginTop: "1.5rem" }}>Imports (landing zone) — {totais.imports}</h2>
-      {imports.length === 0 ? (
-        <p>Nenhum import ainda. Envie um XML BTG acima.</p>
-      ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>Custodiante</th>
-              <th>Content hash</th>
-              <th>Bytes</th>
-              <th>Quando</th>
-            </tr>
-          </thead>
-          <tbody>
-            {imports.map((i) => (
-              <tr key={i.id}>
-                <td>{i.id}</td>
-                <td>{i.custodiante}</td>
-                <td>
-                  <code style={{ fontSize: "0.75rem" }}>
-                    {i.content_hash.slice(0, 16)}…
-                  </code>
-                </td>
-                <td>{i.tamanho_bytes}</td>
-                <td>{i.created_at}</td>
+      <div className="panel">
+        <header>
+          <h2>Imports (landing zone) — {totais.imports}</h2>
+        </header>
+        {imports.length === 0 ? (
+          <div className="empty">
+            <strong>Nenhum import ainda</strong>
+            Envie um XML BTG acima para popular a landing zone.
+          </div>
+        ) : (
+          <table>
+            <caption className="sr-only">Imports na landing zone</caption>
+            <thead>
+              <tr>
+                <th className="num" scope="col">
+                  ID
+                </th>
+                <th scope="col">Custodiante</th>
+                <th scope="col">Content hash</th>
+                <th className="num" scope="col">
+                  Bytes
+                </th>
+                <th scope="col">Quando</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
+            </thead>
+            <tbody>
+              {imports.map((i) => (
+                <tr key={i.id}>
+                  <td className="num">{i.id}</td>
+                  <td>{i.custodiante}</td>
+                  <td>
+                    <code title={i.content_hash}>
+                      {i.content_hash.slice(0, 16)}…
+                    </code>
+                  </td>
+                  <td className="num">{i.tamanho_bytes}</td>
+                  <td>{i.created_at}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
 
-      <h2 style={{ marginTop: "1.5rem" }}>Posições — {totais.posicoes}</h2>
-      {posicoes.length === 0 ? (
-        <p>Nenhuma posição projetada ainda.</p>
-      ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>Carteira</th>
-              <th>Custodiante</th>
-              <th>IUP</th>
-              <th>asof</th>
-              <th>Qtd</th>
-              <th>PU</th>
-            </tr>
-          </thead>
-          <tbody>
-            {posicoes.map((p) => (
-              <tr key={p.id}>
-                <td>{p.id_carteira}</td>
-                <td>{p.custodiante}</td>
-                <td>
-                  {p.iup ? (
-                    <code style={{ fontSize: "0.75rem" }}>{p.iup}</code>
-                  ) : (
-                    <em>pendente (HITL)</em>
-                  )}
-                </td>
-                <td>{p.asof}</td>
-                <td>{p.quantidade}</td>
-                <td>{p.pu ?? "—"}</td>
+      <div className="panel">
+        <header>
+          <h2>Posições — {totais.posicoes}</h2>
+        </header>
+        {posicoes.length === 0 ? (
+          <div className="empty">
+            <strong>Nenhuma posição projetada</strong>
+            Posições aparecem após um import ser processado (direção a).
+          </div>
+        ) : (
+          <table>
+            <caption className="sr-only">Projeção de posições</caption>
+            <thead>
+              <tr>
+                <th scope="col">Carteira</th>
+                <th scope="col">Custodiante</th>
+                <th scope="col">IUP</th>
+                <th scope="col">asof</th>
+                <th className="num" scope="col">
+                  Qtd
+                </th>
+                <th className="num" scope="col">
+                  PU
+                </th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
+            </thead>
+            <tbody>
+              {posicoes.map((p) => (
+                <tr key={p.id}>
+                  <td>{p.id_carteira}</td>
+                  <td>{p.custodiante}</td>
+                  <td>
+                    {p.iup ? (
+                      <code className="truncate" title={p.iup}>
+                        {p.iup}
+                      </code>
+                    ) : (
+                      <span className="badge badge--warn">pendente (HITL)</span>
+                    )}
+                  </td>
+                  <td>{p.asof}</td>
+                  <td className="num">{p.quantidade}</td>
+                  <td className="num">{p.pu ?? "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
 
-      <h2 style={{ marginTop: "1.5rem" }}>IUPs cunhados — {totais.ativos}</h2>
-      {ativos.length === 0 ? (
-        <p>Nenhum IUP cunhado ainda.</p>
-      ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>IUP</th>
-              <th>Chave sintética</th>
-              <th>Quando</th>
-            </tr>
-          </thead>
-          <tbody>
-            {ativos.map((a) => (
-              <tr key={a.id}>
-                <td>{a.id}</td>
-                <td>
-                  <code style={{ fontSize: "0.75rem" }}>{a.iup}</code>
-                </td>
-                <td>
-                  <code style={{ fontSize: "0.75rem" }}>
-                    {a.chave_sintetica ?? "NULL (HITL)"}
-                  </code>
-                </td>
-                <td>{a.created_at}</td>
+      <div className="panel">
+        <header>
+          <h2>IUPs cunhados — {totais.ativos}</h2>
+        </header>
+        {ativos.length === 0 ? (
+          <div className="empty">
+            <strong>Nenhum IUP cunhado</strong>
+            IUPs são cunhados ao resolver identidade (chave forte ou via HITL).
+          </div>
+        ) : (
+          <table>
+            <caption className="sr-only">IUPs cunhados no registro</caption>
+            <thead>
+              <tr>
+                <th className="num" scope="col">
+                  ID
+                </th>
+                <th scope="col">IUP</th>
+                <th scope="col">Chave sintética</th>
+                <th scope="col">Quando</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
+            </thead>
+            <tbody>
+              {ativos.map((a) => (
+                <tr key={a.id}>
+                  <td className="num">{a.id}</td>
+                  <td>
+                    <code className="truncate" title={a.iup}>
+                      {a.iup}
+                    </code>
+                  </td>
+                  <td>
+                    <code
+                      className="truncate"
+                      title={a.chave_sintetica ?? "NULL (HITL)"}
+                    >
+                      {a.chave_sintetica ?? "NULL (HITL)"}
+                    </code>
+                  </td>
+                  <td>{a.created_at}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
     </section>
   );
 }
