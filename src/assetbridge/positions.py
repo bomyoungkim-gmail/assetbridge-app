@@ -49,13 +49,53 @@ def upsert_posicoes(
         reg = IupRegistry(session)
         resolver = lambda identidade: reg.resolve(identidade).iup  # noqa: E731
 
-    n = 0
+    # BTG reporta o mesmo instrumento em vários sub-accounts (disponível/garantia).
+    # Grão = uma linha por (carteira, custodiante, IUP, asof): agrega as
+    # sub-posições do mesmo IUP somando a quantidade e ponderando o PU pela
+    # quantidade (conserva o valor total Σ qtd·pu — ADR-0005, "nada some").
+    # IUP nulo (pendente HITL) NÃO agrega: cada pendência fica sua linha (NULLs
+    # são distintos no unique do Postgres) e é backfillada individualmente.
+    agregadas: dict[str, dict] = {}
+    pendentes: list[tuple[Decimal, Decimal | None]] = []
     for identidade, quantidade, pu in itens:
+        iup = resolver(identidade)
+        if iup is None:
+            pendentes.append((quantidade, pu))
+            continue
+        acc = agregadas.setdefault(iup, {"qtd": Decimal("0"), "valor": Decimal("0"), "pu_nulo": False})
+        acc["qtd"] += quantidade
+        if pu is None:
+            acc["pu_nulo"] = True
+        else:
+            acc["valor"] += quantidade * pu
+
+    n = 0
+    for iup, acc in agregadas.items():
+        # PU agregado = média ponderada (valor/qtd). Se algum PU veio nulo ou a
+        # qtd total é zero, não dá para ponderar → PU nulo (preenchido depois).
+        pu_agg = (
+            acc["valor"] / acc["qtd"]
+            if not acc["pu_nulo"] and acc["qtd"] != 0
+            else None
+        )
         session.add(
             PositionRecord(
                 id_carteira=id_carteira,
                 custodiante=custodiante,
-                iup=resolver(identidade),
+                iup=iup,
+                asof=asof,
+                quantidade=acc["qtd"],
+                pu=pu_agg,
+            )
+        )
+        n += 1
+
+    for quantidade, pu in pendentes:
+        session.add(
+            PositionRecord(
+                id_carteira=id_carteira,
+                custodiante=custodiante,
+                iup=None,
                 asof=asof,
                 quantidade=quantidade,
                 pu=pu,
