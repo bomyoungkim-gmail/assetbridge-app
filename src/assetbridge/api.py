@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
@@ -9,6 +10,7 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -32,6 +34,21 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="AssetBridge", lifespan=lifespan)
+
+# CORS: o backoffice (browser) chama /ingest, /pending/.../decision e /sources
+# cross-origin (origin do front ≠ host:porta da API). Sem isso o browser bloqueia
+# no preflight (ADR-0009). Origens vêm de env (CSV); default = front local (3001).
+_cors_origins = [
+    o.strip()
+    for o in os.environ.get("ASSETBRIDGE_CORS_ORIGINS", "http://localhost:3001").split(",")
+    if o.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(hitl.router)
 app.include_router(source_registry.router)
 app.include_router(catalog.router)

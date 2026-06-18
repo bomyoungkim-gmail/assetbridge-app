@@ -43,6 +43,25 @@ def test_resolve_iup_estruturado_devolve_iup(session):
         app.dependency_overrides.clear()
 
 
+def test_cors_preflight_libera_origem_do_frontend(session):
+    # O frontend (browser, origin http://localhost:3001) chama /ingest,
+    # /pending/.../decision e /sources cross-origin. Sem CORS o browser bloqueia
+    # no preflight. Garante o header Access-Control-Allow-Origin (ADR-0009).
+    client = _client(session)
+    try:
+        r = client.options(
+            "/ingest",
+            headers={
+                "Origin": "http://localhost:3001",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+        assert r.status_code in (200, 204)
+        assert r.headers.get("access-control-allow-origin") == "http://localhost:3001"
+    finally:
+        app.dependency_overrides.clear()
+
+
 _XML_BTG_POSICAO = b"""<?xml version="1.0" encoding="utf-8"?>
 <PosicaoAtivosCarteira xmlns:ISO="urn:iso:std:iso:20022:tech:xsd:semt.003.001.04">
   <ISO:Document>
