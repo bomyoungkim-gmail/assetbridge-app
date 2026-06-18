@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Optional, TypedDict
+import uuid
+from typing import Callable, Optional, TypedDict
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
@@ -28,6 +29,8 @@ class IngestState(TypedDict, total=False):
     decisao: AssetIdentity  # identidade resolvida pelo humano (resume do HITL)
     iup: Optional[str]
     pending: bool
+    novo: bool  # IUP cunhado agora (vs. já existente) — p/ a resposta do contrato
+    motivo: Optional[str]  # razão do pending (HITL), quando aplicável
     enriched: list[str]
 
 
@@ -63,7 +66,12 @@ def build_graph(
         # thread_id do checkpoint vira coluna da pendência (rastreio do HITL).
         thread_id = (config or {}).get("configurable", {}).get("thread_id")
         res = registry.resolve(state["ativo"], thread_id=thread_id)
-        return {"iup": res.iup, "pending": res.pending}
+        return {
+            "iup": res.iup,
+            "pending": res.pending,
+            "novo": res.novo,
+            "motivo": res.motivo,
+        }
 
     def hitl(state: IngestState) -> dict:
         # Só executa após o humano decidir (resume). `interrupt_before` garante
@@ -118,3 +126,20 @@ def build_graph(
     if checkpointer is not None:
         return g.compile(checkpointer=checkpointer, interrupt_before=["hitl"])
     return g.compile()
+
+
+def resolver_via_grafo(graph) -> Callable[[AssetIdentity], Optional[str]]:
+    """Resolver de IUP que roda o GRAFO por ativo (ADR-0010), p/ injetar em
+    `upsert_posicoes`. Cada ativo ganha um `thread_id` próprio: chave forte
+    resolve síncrono (e roda enrich/deliver); ambíguo pausa no
+    `interrupt_before(["hitl"])` e a pendência nasce com esse `thread_id`
+    (habilita poll/resume). Devolve o IUP (ou None se pendente)."""
+
+    def _resolve(ativo: AssetIdentity) -> Optional[str]:
+        thread_id = uuid.uuid4().hex
+        state = graph.invoke(
+            {"ativo": ativo}, {"configurable": {"thread_id": thread_id}}
+        )
+        return state.get("iup")
+
+    return _resolve

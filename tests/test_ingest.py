@@ -1,12 +1,30 @@
 from fastapi.testclient import TestClient
+from langgraph.checkpoint.memory import MemorySaver
 from sqlalchemy import func, select
 
 from assetbridge.api import app, get_session
-from assetbridge.db import ExcludedRecord, LandingRecord, PositionRecord
+from assetbridge.db import (
+    ExcludedRecord,
+    LandingRecord,
+    PendingResolution,
+    PositionRecord,
+)
+from assetbridge.graph import build_graph
+from assetbridge.hitl import get_graph
+
+
+class _NoSource:
+    def buscar(self, ativo):
+        return []
 
 
 def _client(session):
+    # /ingest roda pelo grafo (ADR-0010): grafo hermético (MemorySaver + fonte
+    # vazia) via override do get_graph, sem checkpointer Postgres nem rede.
     app.dependency_overrides[get_session] = lambda: session
+    app.dependency_overrides[get_graph] = lambda: build_graph(
+        session, _NoSource(), checkpointer=MemorySaver()
+    )
     return TestClient(app)
 
 
@@ -126,6 +144,24 @@ def test_ingest_sem_chave_forte_vira_pendencia(session):
         assert client.get("/assets").json()["total"] == 0  # nada cunhado
         pos = client.get("/positions").json()["positions"][0]
         assert pos["iup"] is None
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_ingest_sem_chave_forte_cria_pendencia_com_thread_id(session):
+    # ADR-0010/0008: /ingest roda pelo GRAFO. Posição sem chave forte pausa no
+    # interrupt_before(["hitl"]) e a pendência nasce COM thread_id — habilita o
+    # poll/resume em produção (antes a pendência do /ingest ficava sem thread_id).
+    client = _client(session)
+    try:
+        body = client.post("/ingest", content=_XML_FRACO).json()
+        assert body["pendencias"] == 1
+
+        pend = session.scalars(select(PendingResolution)).first()
+        assert pend is not None
+        assert pend.thread_id is not None
+        # O contrato sync/pending fecha pelo mesmo thread_id.
+        assert client.get(f"/status/{pend.thread_id}").json()["status"] == "pending"
     finally:
         app.dependency_overrides.clear()
 

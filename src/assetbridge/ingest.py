@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from typing import Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -11,7 +12,7 @@ from .db import ExcludedRecord, LandingRecord, PositionRecord
 from .identity import AssetIdentity
 from .landing import store_raw
 from .parser_btg import ParsedFundPosition, parse_position_xml
-from .positions import upsert_posicoes
+from .positions import Resolver, upsert_posicoes
 
 _CUSTODIANTE = "BTG"
 
@@ -32,7 +33,9 @@ class IngestResult:
     parsed: ParsedFundPosition
 
 
-def ingest_btg(session: Session, raw: bytes) -> IngestResult:
+def ingest_btg(
+    session: Session, raw: bytes, resolver: Optional[Resolver] = None
+) -> IngestResult:
     """Ciclo completo da direção a (ADR-0005/0006/0008) sobre o XML BTG.
 
     1. Landing zone por hash — reingestão idêntica é no-op (não recunha IUP nem
@@ -43,6 +46,10 @@ def ingest_btg(session: Session, raw: bytes) -> IngestResult:
        do HITL (não é ativo identificável).
     3. Projeção de posição por `(id_carteira, custodiante, asof)` com
        delete+replace (Q6) via `upsert_posicoes`.
+
+    `resolver` é repassado a `upsert_posicoes`: o `/ingest` injeta o resolver
+    pelo GRAFO (pendência com `thread_id`, enrich/deliver — ADR-0010); o harness
+    e chamadas utilitárias usam o default (resolução direta).
     """
     parsed = parse_position_xml(raw)
     id_carteira = parsed.fund_cnpj or parsed.fund_isin or "?"
@@ -103,6 +110,7 @@ def ingest_btg(session: Session, raw: bytes) -> IngestResult:
         id_carteira=id_carteira,
         asof=asof,
         itens=itens,
+        resolver=resolver,
     )
 
     pendencias = session.scalar(

@@ -1,10 +1,25 @@
 from fastapi.testclient import TestClient
+from langgraph.checkpoint.memory import MemorySaver
+from sqlalchemy import select
 
 from assetbridge.api import app, get_session
+from assetbridge.db import PendingResolution
+from assetbridge.graph import build_graph
+from assetbridge.hitl import get_graph
+
+
+class _NoSource:
+    def buscar(self, ativo):
+        return []
 
 
 def _client(session):
+    # /resolve-iup roda pelo grafo (ADR-0010): sobrescreve get_graph com um grafo
+    # hermético (MemorySaver + fonte vazia), sem checkpointer Postgres nem rede.
     app.dependency_overrides[get_session] = lambda: session
+    app.dependency_overrides[get_graph] = lambda: build_graph(
+        session, _NoSource(), checkpointer=MemorySaver()
+    )
     return TestClient(app)
 
 
@@ -122,6 +137,35 @@ def test_ingest_grava_raw_na_landing_zone(session):
         client.post("/ingest", content=_XML_BTG_POSICAO)
         count = session.scalar(select(func.count()).select_from(LandingRecord))
         assert count == 1
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_resolve_iup_roteia_pelo_grafo_pending_tem_thread_id(session):
+    # ADR-0010/0008: /resolve-iup deve rodar pelo GRAFO. Item ambíguo PAUSA no
+    # interrupt_before(["hitl"]), cria a pendência COM thread_id e devolve o
+    # thread_id p/ o consumidor pollar — não pode resolver direto (sem thread_id).
+    client = _client(session)
+    try:
+        r = client.post(
+            "/resolve-iup",
+            json={"description": "SEM CHAVE FORTE", "cvm_classification": "196"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "pending"
+        assert body["iup"] is None
+        thread_id = body["thread_id"]
+        assert thread_id  # endpoint gerou e devolveu o thread_id
+        # Pendência nasceu pelo forward-run do grafo → carrega o thread_id.
+        pend = session.scalars(
+            select(PendingResolution).where(
+                PendingResolution.thread_id == thread_id
+            )
+        ).first()
+        assert pend is not None
+        # O contrato sync/pending fecha: /status responde pelo mesmo thread_id.
+        assert client.get(f"/status/{thread_id}").json()["status"] == "pending"
     finally:
         app.dependency_overrides.clear()
 

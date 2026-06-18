@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import date
@@ -13,9 +14,9 @@ from sqlalchemy.orm import Session
 from . import catalog, hitl, source_registry
 from .cvm import classificar
 from .db import Base, engine, get_session
-from .identity import AssetIdentity
+from .graph import resolver_via_grafo
+from .identity import AssetIdentity, rotulo_semantico
 from .ingest import ingest_btg
-from .registry import IupRegistry
 
 
 @asynccontextmanager
@@ -64,23 +65,38 @@ class ResolveIupRequest(BaseModel):
 
 
 @app.post("/resolve-iup")
-def resolve_iup(req: ResolveIupRequest, session: Session = Depends(get_session)):
+def resolve_iup(req: ResolveIupRequest, graph=Depends(hitl.get_graph)):
+    """Resolve o IUP rodando o GRAFO de ingestão (ADR-0010): identidade já
+    estruturada (direção b) passa direto no `extract`, `resolve_identity`
+    auto-cunha em chave forte (→ resolved síncrono) ou pausa no
+    `interrupt_before(["hitl"])` em item ambíguo (→ pending + `thread_id`).
+
+    O `thread_id` gerado aqui amarra a pendência ao checkpoint durável e fecha o
+    contrato sync/pending (ADR-0008): o consumidor pollar `/status/{thread_id}` e
+    backfilla o IUP quando o HITL resolver. Chave forte também roda enrich/deliver
+    pelo grafo — o turbinador de BTG (ADR-0010), best-effort."""
     ativo = AssetIdentity(
         tipo=classificar(req.cvm_classification or "", req.description or ""),
         data_vencimento="",
         isin=req.isin,
         cnpj_emissor=req.cnpj,
     )
-    res = IupRegistry(session).resolve(ativo)
+    thread_id = uuid.uuid4().hex
+    state = graph.invoke(
+        {"ativo": ativo}, {"configurable": {"thread_id": thread_id}}
+    )
+    pending = bool(state.get("pending"))
     return {
         # `status` é o campo do contrato (resolved|pending); os demais são
         # detalhe rico do standalone — superset compatível.
-        "status": "pending" if res.pending else "resolved",
-        "iup": res.iup,
-        "rotulo_semantico": res.rotulo_semantico,
-        "novo": res.novo,
-        "pending": res.pending,
-        "motivo": res.motivo,
+        "status": "pending" if pending else "resolved",
+        "iup": state.get("iup"),
+        "rotulo_semantico": None if pending else rotulo_semantico(ativo),
+        "novo": bool(state.get("novo")),
+        "pending": pending,
+        "motivo": state.get("motivo"),
+        # Sempre devolvido: o consumidor pollar `/status/{thread_id}` (ADR-0008).
+        "thread_id": thread_id,
     }
 
 
@@ -89,15 +105,19 @@ async def ingest(
     request: Request,
     x_file_name: str | None = Header(default=None),
     session: Session = Depends(get_session),
+    graph=Depends(hitl.get_graph),
 ):
     """Ingestão de XML BTG (ISO 20022 semt.003.001.04) — modo standalone (direção a).
 
     Ciclo completo (ADR-0005/0006/0008, ver `ingest_btg`): bruto na landing zone
     (no-op se duplicado), roteamento três-vias das posições (chave forte → cunha
     IUP; fraca → HITL; sintética → exclusão auditada) e projeção de posição com
-    delete+replace. Retorna os contadores do ciclo + a posição parseada."""
+    delete+replace. Retorna os contadores do ciclo + a posição parseada.
+
+    Resolve cada posição pelo GRAFO (ADR-0010): pendência sem chave forte nasce
+    com `thread_id` (poll/resume) e o ativo identificado roda enrich/deliver."""
     xml = await request.body()
-    res = ingest_btg(session, xml)
+    res = ingest_btg(session, xml, resolver=resolver_via_grafo(graph))
     return {
         "source": "btg_position_xml",
         "file_name": x_file_name,
